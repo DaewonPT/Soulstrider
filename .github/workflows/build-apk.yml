@@ -1,0 +1,164 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.7.2"
+
+jobs:
+  android:
+    name: Android Export
+    runs-on: ubuntu-24.04
+    container:
+      # Keep this tag fixed: the APK is signed with the image's debug keystore, and installed copies only
+      # accept updates signed with the same key.
+      image: barichello/godot-ci:4.7.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The browser upload takes at most 10 MB per file, so the art travels in packs (arte_*.zip).
+      # They are unpacked first and projeto.zip goes on top, so a file inside projeto.zip always wins.
+      - name: Unpack project
+        run: |
+          rm -rf project && mkdir project
+          for z in arte_*.zip; do
+            if [ -f "$z" ]; then unzip -q -o "$z" -d project; fi
+          done
+          unzip -q -o projeto.zip -d project
+          echo "Files in project: $(find project -type f | wc -l)"
+
+      - name: Setup Godot templates and editor settings
+        run: |
+          mkdir -v -p ~/.local/share/godot/export_templates/
+          mkdir -v -p ~/.config/
+          mv /root/.config/godot ~/.config/godot || true
+          mv /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable || true
+
+      - name: Import project
+        run: |
+          cd project
+          godot --headless --import --quit || true
+
+      - name: Export debug APK
+        run: |
+          mkdir -v -p build
+          EXPORT_DIR="$(readlink -f build)"
+          cd project
+          godot --headless --verbose --export-debug "Android" "$EXPORT_DIR/Soulstrider.apk"
+          ls -la "$EXPORT_DIR"
+
+      # The game checks the latest release on start-up (app_update.gd) and offers the update on the title
+      # screen. The APK carries the version in its name so every download is easy to tell apart on the phone.
+      - name: Read version
+        id: ver
+        run: |
+          NAME=$(sed -n 's/^version\/name="\(.*\)"$/\1/p' project/export_presets.cfg | head -n 1)
+          CODE=$(sed -n 's/^version\/code=\([0-9]*\)$/\1/p' project/export_presets.cfg | head -n 1)
+          if [ -z "$NAME" ] || [ -z "$CODE" ]; then echo "version/name or version/code missing in export_presets.cfg"; exit 1; fi
+          APK="Soulstrider_v$NAME.apk"
+          mv build/Soulstrider.apk "build/$APK"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          { echo "code=$CODE"; echo ""; cat project/notas_versao.txt 2>/dev/null || true; } > build/release_body.md
+          ls -la build
+          cat build/release_body.md
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Soulstrider-APK
+          path: build/${{ steps.ver.outputs.apk }}
+
+      - name: Publish release for in-game updates
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.name }}-b${{ github.run_number }}
+          name: Soulstrider ${{ steps.ver.outputs.name }}
+          body_path: build/release_body.md
+          files: build/${{ steps.ver.outputs.apk }}
+          make_latest: true
+
+      # Test APK for the emulator job: never attached to the release, never blocks it.
+      - name: Export x86_64 test APK (emulator)
+        continue-on-error: true
+        run: |
+          mkdir -v -p build-test
+          TEST_DIR="$(readlink -f build-test)"
+          cd project
+          godot --headless --export-debug "Android x86_64 (teste)" "$TEST_DIR/Soulstrider-x86_64.apk"
+          ls -la "$TEST_DIR"
+
+      - name: Upload test APK
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: Soulstrider-APK-x86_64
+          path: build-test/Soulstrider-x86_64.apk
+          retention-days: 3
+
+  emulator-test:
+    name: Emulator smoke test
+    needs: android
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - name: Download test APK
+        uses: actions/download-artifact@v4
+        with:
+          name: Soulstrider-APK-x86_64
+          path: apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Write check script
+        run: |
+          cat > check.sh <<'SH'
+          #!/bin/bash
+          set -u
+          APK=$(ls apk/*.apk | head -1)
+          adb install -r "$APK" || { echo "Install failed"; exit 1; }
+          adb logcat -c
+          adb shell monkey -p pt.soulstrider.game -c android.intent.category.LAUNCHER 1
+          sleep 40
+          adb exec-out screencap -p > screen_title.png
+          PID=$(adb shell pidof pt.soulstrider.game | tr -d '\r')
+          adb logcat -d > logcat.txt
+          grep -iE "godot|FATAL|AndroidRuntime" logcat.txt > logcat_godot.txt || true
+          if [ -z "$PID" ]; then echo "The app closed by itself"; tail -60 logcat_godot.txt; exit 1; fi
+          if grep -qE "FATAL EXCEPTION|SCRIPT ERROR|Parse Error" logcat.txt; then echo "Errors in logcat"; grep -E "FATAL EXCEPTION|SCRIPT ERROR|Parse Error" -A3 logcat.txt | head -60; exit 1; fi
+          echo "OK: the game started and is still running (pid $PID)"
+          SH
+          chmod +x check.sh
+
+      - name: Run the game on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: ./check.sh
+
+      - name: Upload screenshot and logcat
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emulator-Report
+          path: |
+            screen_title.png
+            logcat_godot.txt
+          retention-days: 7
